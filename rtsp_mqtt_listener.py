@@ -1,159 +1,205 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 import os
 import time
+import sys
+import signal
 import logging
 import requests
-import subprocess
 import threading
+import concurrent.futures
 import paho.mqtt.client as mqtt
-from collections import defaultdict
-from queue import Queue
+import cv2
+import numpy as np
+from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+# Load environment variables from .env file
+load_dotenv()
 
-# Load environment variables
+# --- Configuration from environment ---
 MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.1.15")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "home/automation/camera_capture")
-RTSP_URL_TEMPLATE = os.getenv("RTSP_URL_TEMPLATE", "rtsp://{user}:{password}@{ip}/stream1?tcp")
+MQTT_USER = os.getenv("MQTT_USER")
+MQTT_PASS = os.getenv("MQTT_PASS")
 
-CAMERA_CREDENTIALS = {
-    "user": os.getenv("USER_TPLINK_CAM", "admin"),
-    "password": os.getenv("PASS_TPLINK_CAM", "password")
-}
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Load cameras dynamically from environment variables
-def load_cameras_from_env():
-    """Load camera names and their IP addresses from environment variables."""
-    camera_names = os.getenv("CAMERA_NAMES", "").split(",")
-    ip_cameras = {}
+# Load cameras dynamically.
+# .env should include:
+#   CAMERAS=garage,carport,frontdoor,aothercamera,etc
+#   CAMERA_URL_GARAGE=rtsp://username:password@192.168.1.20/stream1
+#   CAMERA_URL_CARPORT=rtsp://username:password@192.168.1.21/stream1
+#   CAMERA_URL_FRONTDOOR=rtsp://username:password@192.168.1.22/stream1
+#   CAMERA_URL_AOTHERCAMERA=rtsp://username:password@192.168.1.22/stream1
 
-    for camera in camera_names:
-        camera = camera.strip()
-        if camera:
-            ip_cameras[camera] = os.getenv(f"{camera.upper()}_IP")
+# etc
+camera_names = [name.strip() for name in os.getenv("CAMERA_NAMES", "").split(",") if name.strip()]
+IP_CAMERAS = {name: os.getenv(f"CAMERA_URL_{name.upper()}") for name in camera_names if os.getenv(f"CAMERA_URL_{name.upper()}")}
 
-    return ip_cameras
+# --- Thread management ---
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)  # Limit to 3 concurrent captures per camera
+last_captures = {}  # Tracks recent capture times (per camera) for rate limiting
 
-IP_CAMERAS = load_cameras_from_env()
+# --- Logging Configuration ---
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
-# Camera request queues (one per camera)
-camera_queues = {camera: Queue() for camera in IP_CAMERAS}
-active_grabs = defaultdict(lambda: threading.Lock())  # Prevents multiple grabs on the same camera
+# Use 2 threads for OpenCV operations
+cv2.setNumThreads(2)
 
-# Telegram notifications (optional)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# --- Function: Capture a frame using OpenCV ---
+def capture_frame_opencv(camera_name):
+    """Capture a frame from an RTSP stream using OpenCV and send it via Telegram."""
+    if camera_name not in IP_CAMERAS:
+        logging.warning(f"Unknown camera: {camera_name}")
+        return
 
-def send_telegram_message(message):
+    url = IP_CAMERAS[camera_name]
+    start_time = time.time()
+
+    logging.info(f"Attempting to capture frame from: {url}")
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        logging.error(f"Failed to open RTSP stream: {url}")
+        send_telegram_message(f"🚨 RTSP ERROR: {camera_name} failed to open stream")
+        return
+
+    # Set timeouts and reduce buffering for faster capture
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # Use grab/retrieve to minimize decoding overhead
+    cap.grab()
+    ret, frame = cap.retrieve()
+    cap.release()
+
+    if not ret:
+        logging.error(f"Failed to grab frame from {camera_name}")
+        send_telegram_message(f"🚨 RTSP ERROR: {camera_name} failed to grab frame")
+        return
+
+    # Encode frame as JPEG in memory
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+    ret2, im_buf_arr = cv2.imencode(".jpg", frame, encode_param)
+    if not ret2:
+        logging.error(f"Failed to encode image for {camera_name}")
+        send_telegram_message(f"🚨 ERROR: {camera_name} failed to encode frame")
+        return
+
+    image_bytes = im_buf_arr.tobytes()
+    capture_time = round(time.time() - start_time, 2)
+    logging.info(f"Sending image to Telegram (Captured in {capture_time}s)")
+    send_telegram_photo(image_bytes, f"📷 {camera_name} captured in {capture_time} secs")
+
+# --- Telegram Integration Functions ---
+def send_telegram_photo(image_bytes, caption=""):
+    """Send an image to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram bot is disabled (No Token/Chat ID).")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("image.jpg", image_bytes, "image/jpeg")}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+
+    logging.info("Sending image to Telegram API now...")
+    try:
+        response = requests.post(url, files=files, data=data, timeout=10)
+        if response.status_code == 200:
+            logging.info("Telegram API acknowledged message successfully")
+        else:
+            logging.error(f"Telegram API Error: {response.text}")
+    except Exception as e:
+        logging.error(f"Error sending Telegram photo: {e}")
+
+def send_telegram_message(text):
     """Send a text message to Telegram."""
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": message}
-            )
-        except Exception as e:
-            logging.error(f"Failed to send Telegram message: {e}")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        logging.error(f"Error sending Telegram message: {e}")
 
-def send_telegram_photo(photo, caption):
-    """Send a photo to Telegram."""
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                files={"photo": photo}
-            )
-        except Exception as e:
-            logging.error(f"Failed to send Telegram photo: {e}")
+# --- MQTT Event Handlers ---
+def on_connect(client, userdata, flags, rc, properties=None):
+    """Handle MQTT connection events.
 
-def get_camera_ip(camera_name):
-    """Retrieve the IP address of the specified camera."""
-    return IP_CAMERAS.get(camera_name, None)
-
-def get_rtsp_url(camera_name):
-    """Generate RTSP URL for the given camera using the configured template."""
-    ip = get_camera_ip(camera_name)
-    return RTSP_URL_TEMPLATE.format(
-        user=CAMERA_CREDENTIALS["user"],
-        password=CAMERA_CREDENTIALS["password"],
-        ip=ip
-    )
-
-def capture_frame_ffmpeg(camera_name):
-    """Capture a single frame using FFmpeg and send it via Telegram."""
-    url = get_rtsp_url(camera_name)
-    output_path = f"/tmp/{camera_name}.jpg"
-
-    with active_grabs[camera_name]:  # Lock to prevent multiple grabs at once
-        logging.info(f"Capturing frame from: {url}")
-        
-        start_time = time.time()  # Start time tracking
-
-        try:
-            # Grab a single frame using FFmpeg (ensures fast RTSP access)
-            command = f"ffmpeg -rtsp_transport tcp -i {url} -frames:v 1 {output_path} -y"
-            subprocess.run(command, shell=True, check=False)
-
-            capture_duration = round(time.time() - start_time, 2)  # Calculate time taken
-
-            if os.path.exists(output_path):
-                with open(output_path, "rb") as img:
-                    send_telegram_photo(
-                        ("capture.jpg", img),
-                        f"📷 {camera_name} captured in {capture_duration} secs"
-                    )
-                os.remove(output_path)
-            else:
-                send_telegram_message(f"⚠️ Capture failed for {camera_name}")
-
-        except Exception as e:
-            logging.error(f"Capture error ({camera_name}): {str(e)}")
-
-def process_camera_queue(camera_name):
-    """Continuously process capture requests from the queue."""
-    while True:
-        request = camera_queues[camera_name].get()
-        capture_frame_ffmpeg(camera_name)
-        camera_queues[camera_name].task_done()
-        time.sleep(1)  # Small delay to prevent rapid-fire requests
-
-def on_connect(client, userdata, flags, rc):
-    """MQTT connection callback."""
+    Subscribes to the configured MQTT topic upon successful connection.
+    """
     if rc == 0:
         logging.info(f"Connected to MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
         client.subscribe(MQTT_TOPIC)
+        logging.info(f"Subscribed to MQTT topic: {MQTT_TOPIC}")
     else:
-        logging.error(f"MQTT connection failed with error code {rc}")
+        logging.error(f"MQTT connection failed with code {rc}")
 
 def on_message(client, userdata, msg):
-    """MQTT message received callback."""
-    camera_name = msg.payload.decode("utf-8").strip()
-    if camera_name in camera_queues:
-        logging.info(f"Received capture request for: {camera_name}")
-        camera_queues[camera_name].put(camera_name)  # Add request to queue
-    else:
-        logging.warning(f"Unknown camera name received: {camera_name}")
+    """Handle incoming MQTT messages and process capture requests.
 
-def start_mqtt_listener():
-    """Initialize and run MQTT listener indefinitely."""
-    client = mqtt.Client()
+    Decodes the camera name from the message, applies rate limiting, and dispatches
+    a new thread to capture and process the frame.
+    """
+    camera_name = msg.payload.decode("utf-8").strip()
+    if camera_name not in IP_CAMERAS:
+        logging.warning(f"Unknown camera received: {camera_name}")
+        return
+
+    now = time.time()
+    last_captures.setdefault(camera_name, [])
+    # Keep only captures within the last 2 seconds
+    last_captures[camera_name] = [t for t in last_captures[camera_name] if now - t < 2]
+    if len(last_captures[camera_name]) >= 3:
+        logging.info(f"Skipping {camera_name} (Already 3 captures in 2 sec)")
+        return
+
+    last_captures[camera_name].append(now)
+    logging.info(f"Received MQTT request for: {camera_name}")
+    executor.submit(capture_frame_opencv, camera_name)
+
+# --- Graceful Shutdown Handler ---
+def graceful_shutdown(signum, frame):
+    """Handles graceful shutdown on receiving termination signals."""
+    logging.info(f"Received signal {signum}. Initiating graceful shutdown...")
+    client.disconnect()  # Disconnect from MQTT broker
+    executor.shutdown(wait=True)
+    sys.exit(0)
+
+# --- Main Application Entry Point ---
+def main():
+    """Main entry point for the MQTT RTSP Listener application.
+
+    Sets up MQTT client, registers signal handlers, and starts the client loop.
+    """
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, graceful_shutdown)
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+
+    global client  # Make client accessible in the shutdown handler
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
     client.on_message = on_message
 
+    if MQTT_USER and MQTT_PASS:
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+    client.connect(MQTT_BROKER, MQTT_PORT)
+    logging.info("MQTT RTSP Listener Started. Waiting for messages...")
+
+    client.loop_start()  # Start the MQTT network loop in a background thread
     try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.loop_forever()
-    except Exception as e:
-        logging.error(f"MQTT connection error: {e}")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        graceful_shutdown(signal.SIGINT, None)
+    finally:
+        client.loop_stop()
 
 if __name__ == "__main__":
-    logging.info("Starting MQTT RTSP Listener...")
-
-    # Start a queue processing thread for each camera
-    for camera in IP_CAMERAS:
-        threading.Thread(target=process_camera_queue, args=(camera,), daemon=True).start()
-
-    start_mqtt_listener()
+    main()
