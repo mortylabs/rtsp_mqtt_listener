@@ -1,7 +1,20 @@
 FROM python:3.9-slim-bullseye
 
-# Install OS-level dependencies for OpenCV and other libraries
+# Install build dependencies for OpenCV and GStreamer
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    libjpeg-dev \
+    libpng-dev \
+    libtiff-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libv4l-dev \
+    libxvidcore-dev \
+    libx264-dev \
+    libgtk-3-dev \
     libsm6 \
     libxext6 \
     libxrender-dev \
@@ -15,15 +28,15 @@ RUN apt-get update && apt-get install -y \
     libgstreamer1.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Copy the requirements file and install Python dependencies
+# Copy and install Python dependencies
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your application code
+# Copy application code
 COPY . .
 
-# Command to run your script
+# Run the application
 CMD ["python", "rtsp_mqtt_listener.txt"]
