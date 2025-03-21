@@ -38,5 +38,5 @@ jobs:
         with:
           context: .
           push: true
-          tags: your_dockerhub_username/rtsp-mqtt-listener:latest
+          tags: mortyone/rtsp-mqtt-listener:latest
           platforms: linux/arm/v7
